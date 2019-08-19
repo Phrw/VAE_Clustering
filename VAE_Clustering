@@ -1,0 +1,769 @@
+from keras.layers import Input, Dense, Lambda
+from keras.models import Model, Sequential
+from keras import backend as K
+from keras.losses import mse
+from keras.optimizers import Adam
+import numpy as np
+from scipy.cluster.hierarchy import fcluster
+from matplotlib import colors as Color
+from mpl_toolkits.mplot3d import Axes3D
+from numpy.linalg import slogdet
+import numpy.linalg as la
+from matplotlib import pylab as plt
+from scipy.stats import multivariate_normal
+
+"""
+           From Master's Thesis
+           -----
+           Hierarchical Clustering of Time Series using Gaussian Mixture Models and Variational Autoencoders.
+
+
+           Written by
+           -----
+           Per Wilhelmsson, M.Sc Engineering Mathematics, Lund University. (Phrw@hotmail.com) 
+
+
+           Notes
+           -----
+           Clusters time series using a variational autoencoder to reduce the dimensionality of the data
+           and a gaussian mixture model to group them in the latent space.
+           Rename file to '__main__' to run example code with generated clusters of time series. (See the last rows of this file).
+           
+"""
+
+
+def VAEClustering(data,
+                    dimensions=2,
+                    learning_rate=0.001,
+                    Beta=1,
+                    nu=3,
+                    alpha=0.5,
+                    epochs=200,
+                    batch_size=32,
+                    middle_dimension=16,
+                    movie=False,
+                    pair=-1,
+                    proportional=True,
+                    change_shape=False,
+                    number_of_clusters=12,
+                    shape_ratio=8):
+    """
+
+            Parameters
+            ----------
+            data: numpy.ndarray (n, d)
+                Array of data where each row is a time series (or general data point) and the columns are the time steps
+            dimensions: INT (1,Inf)
+                Decides the dimensionality of the latent space. 2 or 3 is recommended for visualisations and
+                for effective clustering.
+            learning_rate:  float (0, Inf)
+                Learning rate for the autoencoder.
+            Beta:  float (0, Inf)
+                Controls the importance of the modified KL-divergence.
+            alhpa:  float (0, Inf)
+                Controls the size of the latent space (small alpha --> large space).
+            nu: float (0, Inf)
+                Controls the size of the standard deviations in the variational middle layer. (large nu --> large standard deviations).
+            epochs: INT (1, Inf)
+                Number of epochs in the autoencoder
+            batch_size: INT (1, Inf)
+                Number of data points in each batch in the autoencoder.
+            middle_dimension: INT (1,Inf)
+                Dimensionality of the second layer in the autoencoder
+            movie: Boolean
+                Creates pictures over the latent space from training iterations.
+            pair: INT (-1, Inf)
+                The number of clusters to be paired using shortest distnace instead of maximum likelihood.
+            proportional: Boolean
+                Decides whether to merge the least decrease of likelihood or on least average decrease of likelihood.
+            change_shape: Boolean
+                Decides whether all dimensions of the gaussian ellips should be altered when the ellips is overfitting the data.
+            number_of_clusters: Int (0, Inf)
+                Specifies the number of clusters. If equal to zero, no clusters are made and the Linkage matrix contain all cluster information.
+            shape_ratio: float (0, Inf)
+                Specifies the maximal ratio between smallest and largest eigenvalue of the estimated covariance matrix
+                in the GMM. Alters the ellips such that the smallest eigenvalue is equal to largest eigenvalue over shape_ratio
+
+
+            Returns
+            -------
+            Cluster object with the following content:
+            data: np.ndarray (n, d)
+                Original data
+            latent_space: np.ndarray(n,dimensions)
+                The coordinates of the latent space representation
+            latent_space_std: np.ndarray(n,dimensions)
+                The standard deviations in every dimension for every data point in the latent space.
+            Linkage: np.ndarray(n-1,4)
+                The Linkage matrix contain the hierarhcical structure. More info here: https://docs.scipy.org/doc/scipy/reference/generated/scipy.cluster.hierarchy.linkage.html
+            log_likelihood: np.ndarray(n-pair,1)
+                The log likelihood for every number of clusters.
+            reconstruction: np.ndarray(n,d)
+                Reconstruction of the input data.
+            Clusters: np.ndarray(n,1)
+                Cluster assignments.
+            individual_likelihood: np.ndarray(n,1)
+                Likelihood value for each point.
+            number_of_clusters: INT
+                Number of clusters in the Clusters array.
+
+            """
+
+    global SHAPE_RATIO, CHANGE_SHAPE, PAIR, PROPORTIONAL, LOG2
+    SHAPE_RATIO = shape_ratio
+    CHANGE_SHAPE = change_shape
+    PAIR = pair
+    PROPORTIONAL = proportional
+    LOG2 = np.log(2 * np.pi)
+
+
+
+
+
+    "Create latent space representation"
+    latent_space, latent_space_noise, latent_space_std, reconstruction = LatentSpace(data=data, dimensions=dimensions,
+                                                                                     learning_rate=learning_rate,
+                                                                                     Beta=Beta, nu=nu,
+                                                                                     alpha=alpha, epochs=epochs,
+                                                                                     batch_size=batch_size,
+                                                                                     middle_dimension=middle_dimension,
+                                                                                     movie=movie)
+
+    "Creates a linkage matrix for the latent space using likelihood hierarchical clusteirng"
+    Linkage, log_likelihood = lhc(data=latent_space, prior=latent_space_std)
+
+
+    if number_of_clusters == 0:
+        "If no clusters are asked for, return latent space without clusteirng"
+        out = np.zeros((latent_space.shape[0], 1))
+        Cluster_out = Cluster(data,latent_space, latent_space_std, Linkage, log_likelihood, reconstruction, out, out)
+        return Cluster_out
+
+    elif number_of_clusters > 0:
+        "Creates the desired number of clusters from the linkage matrix. Saves all information in a Cluster object 'Cluster_out'. "
+        Clusters = fcluster(Linkage, number_of_clusters, criterion='maxclust')
+        Clusters, log_likelihood_model, individual_likelihood = recluster(data=latent_space, clusters=Clusters,
+                                                                          prior=latent_space_std, repeat=1)
+        Cluster_out = Cluster(data,latent_space, latent_space_std, Linkage, log_likelihood, reconstruction, Clusters,
+                              individual_likelihood)
+        return Cluster_out
+
+
+
+
+def LatentSpace(data,
+                dimensions=2,
+                learning_rate=0.001,
+                Beta=1,
+                nu=3,
+                alpha=0.5,
+                epochs=1000,
+                batch_size=32,
+                middle_dimension=16,
+                movie=False):
+    "Trains Autoencoders and exports:" \
+    "1. LatentSpace coordinates" \
+    "2. LatentSpace_noisy_version " \
+    "3. LatentSpace_std" \
+    "4. Reconstruction."
+
+
+    "Read Data"
+    ncol = data.shape[1]
+    input_shape = (ncol,)
+
+
+
+    "Initialise the Variational Autoencoder"
+    """"""
+
+    "Encoder"
+    inputs = Input(shape=input_shape, name='encoder_input')
+    x = Dense(64, activation='elu')(inputs)
+    x = Dense(middle_dimension, activation='elu')(x)
+
+    "Variational Middlelayer"
+    z_log_var = Dense(dimensions, name='z_log_var')(x)
+    z_mean = Dense(dimensions, activation='elu', name='z_mean')(x)
+    z = Lambda(sampling, output_shape=(dimensions,), name='z')([z_mean, z_log_var])
+    encoder = Model(inputs, [z_mean, z_log_var, z], name='encoder')
+
+    "Decoder"
+    decoder = Sequential()
+    decoder.add(Dense(middle_dimension, activation='elu', input_shape=(dimensions,)))
+    decoder.add(Dense(64, activation='elu'))
+    decoder.add(Dense(ncol, activation='linear', name="L5"))
+
+    "Autoencoder"
+    Output = decoder(encoder(inputs)[2])
+    Autoencoder = Model(inputs, Output)
+
+
+
+    "Loss function"
+    """"""
+
+    "Reconstruction loss"
+    reconstruction_loss = mse(inputs, Output)
+    reconstruction_loss *= ncol
+
+    "Altered KL Divergence"
+    kl_loss = -alpha * K.square(z_mean) + nu * z_log_var + 1 - K.exp(z_log_var)
+    kl_loss = K.sum(kl_loss, axis=-1)
+    kl_loss *= -0.5
+
+    "Add loss and compile"
+    Loss = K.mean(reconstruction_loss + Beta * kl_loss)
+    Autoencoder.add_loss(Loss)
+    Autoencoder.compile(optimizer=Adam(lr=learning_rate))
+    Autoencoder.summary()
+    decoder.compile(loss=mse, optimizer=Adam(lr=learning_rate))
+
+
+
+    "Training and export results"
+    if movie == False:
+        Autoencoder.fit(data, batch_size=batch_size, epochs=epochs, verbose=2)
+        LatentSpace = encoder.predict(data)[0]
+        LatentSpace_noise = encoder.predict(data)[2]
+        std = np.exp(0.5 * encoder.predict(data)[1])
+        Reconstruction = Autoencoder.predict(data)
+
+        return LatentSpace, LatentSpace_noise, std, Reconstruction
+    else:
+        for i in range(epochs):
+            if i < 51:
+                LatentSpace = encoder.predict(data)[0]
+                fig = plt.figure(figsize=(8, 8))
+                ax = fig.add_subplot(111)
+                ax.scatter(LatentSpace[:, 0], LatentSpace[:, 1], s=25, alpha=0.9)
+                plt.title('Latent Space, iteration %d' % i)
+                ax.set_xlabel('Dimension 1')
+                ax.set_ylabel('Dimension 2')
+                plt.xlim((-1.5, 10))
+                plt.ylim((-1.5, 10))
+                plt.tight_layout()
+                plt.savefig('Movie/Movie%d.png' % i)
+                Autoencoder.fit(data, batch_size=batch_size, epochs=1, verbose=2)
+                plt.close(fig)
+            if i > 50 and i % 3 == 0:
+                LatentSpace = encoder.predict(data)[0]
+                fig = plt.figure(figsize=(8, 8))
+                ax = fig.add_subplot(111)
+                ax.scatter(LatentSpace[:, 0], LatentSpace[:, 1], s=25, alpha=0.9)
+                plt.title('Latent Space, iteration %d' % i)
+                ax.set_xlabel('Dimension 1')
+                ax.set_ylabel('Dimension 2')
+                plt.xlim((-1.5, 10))
+                plt.ylim((-1.5, 10))
+                plt.tight_layout()
+                plt.savefig('Movie/Movie%d.png' % i)
+                Autoencoder.fit(data, batch_size=batch_size, epochs=1, verbose=2)
+                plt.close(fig)
+
+        LatentSpace = encoder.predict(data)[0]
+        LatentSpace_noise = encoder.predict(data)[2]
+        std = np.exp(0.5 * encoder.predict(data)[1])
+        Reconstruction = Autoencoder.predict(data)
+        return LatentSpace, LatentSpace_noise, std, Reconstruction
+
+
+def sampling(args):
+    """
+    Samples from the latent distribution for the variational middle layer
+    """
+    z_mean, z_log_var = args
+    batch = K.shape(z_mean)[0]
+    dim = K.int_shape(z_mean)[1]
+
+    epsilon = K.random_normal(shape=(batch, dim))
+    return z_mean + K.exp(0.5 * z_log_var) * epsilon
+
+
+
+def lhc(data, prior=np.zeros((1, 1))):
+    "Clusters the data into a hierarchy using the likelihood given by" \
+    "a fitted gaussian mixture model."
+
+
+    "Initialise"
+    if prior.shape[0] != data.shape[0]:
+        prior = np.ones(data.shape)
+    n_nodes, nrow, pair = initialise_constants(data, PAIR)
+    linkage = Linkage(nrow)
+    linkage.pair_closests(pair, data)
+    total_log_likelihood = np.zeros((n_nodes - 1, 3))
+    likelihood_matrix = -50000000 * np.ones((n_nodes, n_nodes))
+
+    while n_nodes > 1:
+        print(n_nodes)
+        indices, nodes, linkage = initialise_nodes(linkage, n_nodes, nrow)
+        temp_total_loglike = fill_temp_loglike(n_nodes, data, nodes, prior)
+
+        "For each pair of clusters (nodes), compute the merger score."
+        if n_nodes == int(nrow - pair):
+            "if likelihood merger is used for the first time."
+            for i in range(0, n_nodes):
+                for j in range(i + 1, n_nodes):
+                    denom = 1 + int(PROPORTIONAL) * ((len(nodes[i]) + len(nodes[j])) - 1)
+                    in_data = np.vstack((data[nodes[i]], data[nodes[j]]))
+                    in_prior = np.vstack((prior[nodes[i]], prior[nodes[j]]))
+                    likelihood_matrix[i, j] = get_log_likelihood(in_data, in_prior) / denom
+        else:
+            "if likelihood merger is already used once, we can use saved results from last iteration."
+            i = 0
+            for j in range(1, n_nodes):
+                denom = 1 + int(PROPORTIONAL) * ((len(nodes[i]) + len(nodes[j])) - 1)
+                in_data = np.vstack((data[nodes[i]], data[nodes[j]]))
+                in_prior = np.vstack((prior[nodes[i]], prior[nodes[j]]))
+                likelihood_matrix[i, j] = get_log_likelihood(in_data, in_prior) / denom
+
+        "Merge the highest-scoring pair"
+        i, j = np.unravel_index(likelihood_matrix.argmax(), likelihood_matrix.shape)
+        in_data = np.vstack((data[nodes[i]], data[nodes[j]]))
+        in_prior = np.vstack((prior[nodes[i]], prior[nodes[j]]))
+        temp_total_loglike[i] = get_log_likelihood(in_data, in_prior)
+        temp_total_loglike[j] = 0
+        total_log_likelihood[n_nodes - 2, 0] = np.sum(temp_total_loglike)
+        total_log_likelihood[n_nodes - 2, 1] = len(nodes[i])
+        total_log_likelihood[n_nodes - 2, 2] = len(nodes[j])
+        linkage.update(index0=indices[i], index1=indices[j], index2=total_log_likelihood[n_nodes - 2, 0],
+                       index3=len(nodes[j]) + len(nodes[i]),
+                       index=2 * nrow - n_nodes)
+
+        likelihood_matrix = update(likelihood_matrix, n_nodes, i, j)
+        n_nodes -= 1
+
+    out_log_likelihood = np.zeros((total_log_likelihood.shape[0] + 1, 1))
+    out_log_likelihood[0] = total_log_likelihood[0, 0]
+    for i in range(total_log_likelihood.shape[0]):
+        out_log_likelihood[i + 1] = total_log_likelihood[i, 0]
+
+    outmatrix = linkage.matrix[nrow:, :4]
+    outmatrix[:, 2] = np.arange(0, nrow - 1)
+
+    return outmatrix, out_log_likelihood
+
+
+def initialise_nodes(linkage, n_nodes, nrow):
+    "Nodes are clusters. Every row in Nodes contains indices for a cluster."
+
+    k = int(2 * nrow - n_nodes - 1)
+    indices = np.zeros((n_nodes, 1))
+    i = 0
+    nodes = {}
+    while k > -1:
+        if linkage.matrix[k, 4] == 1:  # If this cluster has not been used yet.
+            nodes[i] = np.array(linkage.get_index(k, nrow))
+            indices[i] = k
+            linkage.set_zero(k)
+            i += 1
+            k -= 1
+        else:
+            k -= 1
+
+    linkage.fill(int(2 * nrow - n_nodes))
+
+    return indices, nodes, linkage
+
+
+def initialise_constants(data, pair):
+    nrow = data.shape[0]
+
+    if pair == -1 or pair >= nrow:
+        temp_pair = int(np.floor(data.shape[0] * 3 / 4))
+    else:
+        temp_pair = pair
+
+    temp_pair = int(temp_pair)
+    n_nodes = int(nrow - temp_pair)
+    return n_nodes, nrow, temp_pair
+
+
+def fill_temp_loglike(n_nodes, data, nodes, prior):
+    temp_total_loglike = np.zeros((n_nodes, 1))
+    for i in range(0, n_nodes):
+        in_data = data[nodes[i]]
+        in_prior = prior[nodes[i]]
+        temp_total_loglike[i] = get_log_likelihood(in_data, in_prior)
+
+    return temp_total_loglike
+
+
+def get_log_likelihood(data, prior):
+    "Calculates log likelihood for the fitted model to DATA."
+
+    d = data.shape[1]
+    Pmerge = 0
+    mean, covariance = get_parameters(data, prior)
+    sign, detr = slogdet(covariance)
+    try:
+        CovInv = la.inv(covariance)
+        for rows in data:
+            v = (rows - mean)
+            vv = np.matmul(v, CovInv)
+            Pmerge += (-d * LOG2 - sign * detr - np.matmul(vv, v.T)) / 2
+        return Pmerge
+    except:
+        return Pmerge
+
+
+def get_parameters(data, prior):
+    "Calculate the parameters for a fitted Gaussian Mixture Model confined by the chosen shape ratio on the variances."
+    initial_variance = np.identity(data.shape[1]) * np.mean((prior ** 2), axis=0)
+    n = data.shape[0]
+    d = data.shape[1]
+    if n == 1:
+        covariance = initial_variance
+    else:
+        covariance = (np.cov(data.T) * (n - 1) + initial_variance) / n
+
+    eigenvalues, eigenvectors = la.eig(covariance)
+    min_eig = np.min(eigenvalues)
+    max_eig = np.max(eigenvalues)
+    "Increases the smallest standard deviation to avoid overfitting"
+    while min_eig * ((SHAPE_RATIO * 1.01) ** 2) < max_eig:
+        sum = np.sqrt(min_eig) + np.sqrt(max_eig)
+        eigenvalues[np.argmin(eigenvalues)] = max_eig / ((SHAPE_RATIO) ** 2)
+        min_eig = np.min(eigenvalues)
+        if CHANGE_SHAPE == True:
+            "Decreases the size of the gaussian ellipsoid to avoid overfitting"
+            rat = (sum / (np.sqrt(min_eig) + np.sqrt(max_eig))) ** 2
+            eigenvalues = eigenvalues * rat
+        covariance = np.matmul(np.matmul(eigenvectors, np.identity(d) * eigenvalues), la.inv(eigenvectors))
+        min_eig = np.min(eigenvalues)
+        max_eig = np.max(eigenvalues)
+    mean = np.mean(data, axis=0)
+    return mean, covariance
+
+
+def update(likelihood_matrix, n_nodes, i, j):
+    "Updates the likelihood matrix by saving current results strategically."
+    temp_likelihood_matrix = likelihood_matrix
+    matrix = -50000000 * np.ones((n_nodes - 1, n_nodes - 1))
+    temp_likelihood_matrix = np.delete(temp_likelihood_matrix, [i, j], 0)
+    temp_likelihood_matrix = np.delete(temp_likelihood_matrix, [i, j], 1)
+    matrix[1:, 1:] = temp_likelihood_matrix
+    return matrix
+
+
+def recluster(data, clusters, prior, repeat=1):
+    "Reclusters the data by assigning each point to its maximum likelihood cluster"
+    "Returns:" \
+    "1. Cluster assignments" \
+    "2. Total log likelihood" \
+    "3. Individual_likelihood"
+    old_clusters = clusters
+    K = np.max(clusters)
+    d = data.shape[1]
+    nrow = data.shape[0]
+    R = np.zeros((nrow, K))
+    total_log_likelihood = np.zeros((K, 1))
+    while repeat > 0:
+        for i in range(0, K):
+            cluster_data = data[clusters == i + 1]
+            cluster_prior = prior[clusters == i + 1]
+            Mean, covariance = get_parameters(cluster_data, cluster_prior)
+            for k in range(0, nrow):
+                try:
+                    R[k, i] = multivariate_normal.pdf(x=data[k], mean=Mean, cov=covariance)
+                except:
+                    R[k, i] = multivariate_normal.pdf(x=data[k], mean=Mean,
+                                                      cov=np.multiply(covariance, np.identity(d)))
+
+        for i in range(nrow):
+            clusters[i] = np.argmax(R[i]) + 1
+
+        repeat -= 1
+    check = 1
+    count = 0
+    while check == 1:
+        check = 0
+        for i in range(K):
+            cluster_data = data[clusters == i + 1]
+            if len(cluster_data) == 0:
+                clusters[np.argmax(R[:, i])] = i + 1
+                check = 1
+                count += 1
+        if count > 50:
+            return old_clusters, 0, 0
+
+    individual_likelihood = np.zeros((nrow, 1))
+    for i in range(K):
+        cluster_prior = prior[clusters == i + 1]
+        in_data = data[np.where(clusters == i + 1)[0]]
+        total_log_likelihood[i] = get_log_likelihood(in_data, cluster_prior)
+        cluster_data = data[clusters == i + 1]
+        nrow_temp = cluster_data.shape[0]
+        Mean, covariance = get_parameters(cluster_data, cluster_prior)
+        try:
+            individual_likelihood[clusters == i + 1] = multivariate_normal.pdf(x=cluster_data, mean=Mean,
+                                                                               cov=covariance).reshape(
+                nrow_temp, 1)
+        except:
+            individual_likelihood[clusters == i + 1] = multivariate_normal.pdf(x=cluster_data,
+                                                                               mean=Mean,
+                                                                               cov=np.multiply(covariance,
+                                                                                               np.identity(d))).reshape(
+                nrow_temp, 1)
+    tot_like = np.sum(total_log_likelihood)
+    return clusters, tot_like, individual_likelihood
+
+
+class Linkage(object):
+    """
+        Linkage matrix contains the hierarchical structure.
+        0. First cluster: index of first cluster
+        1. Second cluster: index of second cluster.
+        2. Mean Loglikelihood of cluster.
+        3: Number of elements in this cluster
+        4: Dummy variable to control recursive search through the matrix.
+
+        """
+
+    def __init__(self, nrow):
+        self.matrix = np.zeros((2 * nrow - 1, 5))
+        self.matrix[:nrow, 0] = np.arange(0, nrow)
+        self.matrix[:nrow, 1] = np.arange(0, nrow)
+        self.matrix[:nrow, 2] = 1
+        self.matrix[:nrow, 3] = 1
+        self.matrix[:nrow, 4] = 1
+        self.nrow = nrow
+
+    def get_index(self, index, nrow):
+        """
+        This function finds the data point indices of cluster index.
+        The tree structure is stored in the Linkage matrix and needs a
+        recursive function to find all data points in a cluster.
+        """
+
+        index1 = int(self.matrix[index, 0])
+        index2 = int(self.matrix[index, 1])
+
+        if index1 == index2:
+            return np.array([index1])
+
+        elif index2 < nrow:
+            out = np.hstack((self.get_index(index1, nrow), index2))
+            return out
+
+        elif index1 < nrow:
+            out = np.hstack((index1, self.get_index(index2, nrow)))
+            return out
+
+        else:
+
+            out = np.hstack((self.get_index(index1, nrow), self.get_index(index2, nrow)))
+            return out
+
+    def set_zero(self, index):
+        index1 = int(self.matrix[index, 0])
+        index2 = int(self.matrix[index, 1])
+        self.matrix[index, 4] = 0
+
+        if index1 == index2:
+            self.matrix[index1, 4] = 0
+            self.matrix[index2, 4] = 0
+            return
+
+        elif index2 < self.nrow:
+            self.matrix[index2, 4] = 0
+            self.set_zero(index1)
+            return
+
+        elif index1 < self.nrow:
+            self.matrix[index1, 4] = 0
+            self.set_zero(index2)
+            return
+
+        else:
+            self.set_zero(index2)
+            self.set_zero(index1)
+            return
+
+    def fill(self, index):
+        self.matrix[:index, 4] = 1
+        return
+
+    def update(self, index0, index1, index2, index3, index):
+        self.matrix[index, 0] = index0
+        self.matrix[index, 1] = index1
+        self.matrix[index, 2] = index2
+        self.matrix[index, 3] = index3
+        self.matrix[index, 4] = 1
+
+    def pair_closests(self, k, Data):
+        """
+        This function finds the two clusters with closests means and merges them,
+        and repeats it k times. This function is used to speed up the BHC algorithm and
+        works as regular agglomerative hierarchical clustering for the k first clusters.
+        """
+        N = Data.shape[0]
+        M = 100000
+        Distance = np.ones((N + k, N + k)) * 10000
+        DataTemp = Data.copy()
+        nrow = Data.shape[0]
+        for i in range(0, N):
+            for j in range(i + 1, N):
+                Distance[i, j] = np.sqrt(np.sum(np.power(Data[i] - Data[j], 2)));
+
+        for i in range(nrow, nrow + k):
+
+            index = np.unravel_index(Distance.argmin(), Distance.shape)
+            indices1 = self.get_index(index[0], nrow)
+            indices2 = self.get_index(index[1], nrow)
+            DataTemp = np.vstack((DataTemp, np.mean(np.vstack((DataTemp[indices1], DataTemp[indices2])), axis=0)))
+            for j in range(0, i):
+                if Distance[j, i] < 10001:
+                    Distance[j, i] = np.sqrt(np.sum(np.power(DataTemp[i] - DataTemp[j], 2)));
+
+            Distance[i, i] = M
+            Distance[:, indices1] = M
+            Distance[:, indices2] = M
+            Distance[indices1, :] = M
+            Distance[indices2, :] = M
+            Distance[:, index[0]] = M
+            Distance[:, index[1]] = M
+            Distance[index[0], :] = M
+            Distance[index[1], :] = M
+
+            nk = len(indices1) + len(indices2)
+            log_like = 1
+            self.update(index[0], index[1], log_like, nk, i)
+            print(2 * nrow - i)
+
+        return
+
+
+class Cluster(object):
+    """
+        A cluster object contains all data and results from the algorithm.
+            - Original data
+            - Latent space representation
+            - Latent space standard deviation
+            - Linkage matrix
+            - Log likelihood for every number of clusters
+            - Reconstruction of the original data
+            - Cluster assignments
+            - likelihood for every latent space representation under the current model.
+            - total number of clusters.
+
+        """
+
+    def __init__(self, data, latent_space, latent_space_std, Linkage, log_likelihood, reconstruction, Clusters,
+                 individual_likelihood):
+        self.data = data
+        self.latent_space = latent_space
+        self.latent_space_std = latent_space_std
+        self.Linkage = Linkage
+        self.log_likelihood = log_likelihood
+        self.reconstruction = reconstruction
+        self.Clusters = Clusters
+        self.individual_likelihood = individual_likelihood
+        self.number_of_clusters = np.max(Clusters)
+        return
+
+    def plot_latentspace(self,number_of_clusters = 0, cluster_color = True):
+        "Plots a scatter plot of the latent space."
+
+        if number_of_clusters == 0:
+            number_of_clusters = self.number_of_clusters
+        Clusters = fcluster(self.Linkage, number_of_clusters, criterion='maxclust')
+        Clusters, log_likelihood_model, individual_likelihood = recluster(data=self.latent_space, clusters=Clusters,
+                                                                              prior=self.latent_space_std, repeat=1)
+        if self.latent_space.shape[1] > 2 and number_of_clusters < 21 and number_of_clusters > 0:
+            print('The total log likelihood for %d clusters is:' % number_of_clusters)
+            print(self.log_likelihood[number_of_clusters])
+
+            fig = plt.figure(figsize=(8, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            if cluster_color == True:
+                ax.scatter(self.latent_space[:, 0], self.latent_space[:, 1], self.latent_space[:, 2], s=25, c=Clusters,
+                       cmap='tab20', alpha=0.9)
+            else:
+                ax.scatter(self.latent_space[:, 0], self.latent_space[:, 1], self.latent_space[:, 2], s=25, cmap='tab20', alpha=0.9)
+
+            plt.title('Latent Space')
+            ax.set_xlabel('Dimension 1')
+            ax.set_ylabel('Dimension 2')
+            ax.set_zlabel('Dimension 3')
+            plt.tight_layout()
+            plt.show()
+        elif self.latent_space.shape[1] == 2 and number_of_clusters < 21 and number_of_clusters > 0:
+            print('The total log likelihood for %d clusters is:' % number_of_clusters)
+            print(self.log_likelihood[number_of_clusters])
+
+            fig = plt.figure(figsize=(8, 8))
+            ax = fig.add_subplot(111)
+            if cluster_color == True:
+                ax.scatter(self.latent_space[:, 0], self.latent_space[:, 1], s=25, c= Clusters,
+                       cmap='tab20', alpha=0.9)
+            else:
+                ax.scatter(self.latent_space[:, 0], self.latent_space[:, 1], s=25,
+                           cmap='tab20', alpha=0.9)
+
+            plt.title('Latent Space, K = %d' % number_of_clusters)
+            ax.set_xlabel('Dimension 1')
+            ax.set_ylabel('Dimension 2')
+            plt.tight_layout()
+            plt.show()
+        elif number_of_clusters > 20 or number_of_clusters < 1:
+            print('ERROR: Can only plot 1-20 clusters.')
+        return
+
+    def plot_reconstruction(self, plots=10):
+        "Plots the reconstructed time series."
+        nrow = self.data.shape[0]
+        if plots < 1 or plots > nrow:
+            plots = nrow
+        numbers = np.random.choice(nrow, plots, replace=False)
+        for i in numbers:
+            plt.figure(figsize=(8, 8))
+            plt.title('Time Series nr %d' % i)
+            plt.plot(self.data[i], 'b', label='Real')
+            plt.plot(self.reconstruction[i], 'r', label='Reconstruction')
+            plt.legend(loc='upper left')
+            plt.show()
+        return
+
+    def plot_loglikelihood(self, number = 0):
+        if number == 0 or number > self.log_likelihood.shape[0]:
+            number = self.log_likelihood.shape[0]
+
+        plt.figure(figsize=(8, 8))
+        plt.title('Log likelihood for number of clusters')
+        plt.plot(self.log_likelihood[:number+1], label='Log likelihood')
+        plt.xlim((1,number))
+        plt.legend(loc='upper left')
+        plt.show()
+        return
+
+    def plot(self):
+        self.plot_loglikelihood(number = 0)
+        self.plot_latentspace()
+        self.plot_reconstruction()
+
+
+if __name__ == '__main__':
+
+    "Create 4 clusters of time series with 100 series each"
+    import numpy as np
+    np.random.seed(100)
+    Y = np.zeros((400, 100))
+    T1 = np.random.normal(size=(1, 100))
+    T2 = np.random.normal(size=(1, 100))
+    T3 = np.random.normal(size=(1, 100))
+    T4 = np.random.normal(size=(1, 100))
+    for i in range(100):
+        Y[i] = T1 + np.random.normal(loc=np.random.normal(scale=0.5), scale=0.1, size=(1, 100))
+    for i in range(100):
+        Y[100 + i] = T2 + np.random.normal(loc=np.random.normal(scale=0.5), scale=0.1, size=(1, 100))
+    for i in range(100):
+        Y[200 + i] = T3 + np.random.normal(loc=np.random.normal(scale=0.5), scale=0.1, size=(1, 100))
+    for i in range(100):
+        Y[300 + i] = T4 + np.random.normal(loc=np.random.normal(scale=0.5), scale=0.1, size=(1, 100))
+
+    "Run the clustering algorithm"
+    LatentSpace = VAEClustering(Y, epochs=100)
+    LatentSpace.plot()
+
